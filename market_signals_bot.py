@@ -1,3 +1,4 @@
+# market_signals_bot.py
 import os
 import json
 from datetime import datetime, timedelta
@@ -10,24 +11,16 @@ import atexit
 import pandas as pd
 
 # ===========================
-# الإعدادات والمتغيرات البيئية
+# إعداد المتغيرات البيئية
 # ===========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise ValueError("يجب تعيين متغير البيئة TELEGRAM_TOKEN")
-
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
-if not NOWPAYMENTS_API_KEY:
-    raise ValueError("يجب تعيين متغير البيئة NOWPAYMENTS_API_KEY")
-
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
-if not NOWPAYMENTS_IPN_SECRET:
-    raise ValueError("يجب تعيين متغير البيئة NOWPAYMENTS_IPN_SECRET")
+PORT = int(os.getenv("PORT", 5000))
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 WEBHOOK_ROUTE = "/market-signals-bot/telegram-webhook"
 NOWPAYMENTS_ROUTE = "/market-signals-bot/nowpayments-webhook"
-PORT = int(os.getenv("PORT", 5000))
 
 # ===========================
 # قاعدة البيانات
@@ -51,10 +44,10 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    strategy = Column(String, nullable=False, default="strategy_one")
+    strategy = Column(String, nullable=False, default="strategy_advanced")
     start_date = Column(DateTime)
     end_date = Column(DateTime)
-    status = Column(String, default="active")  # active, expired
+    status = Column(String, default="active")
     payment_id = Column(String, nullable=True)
     amount = Column(Float, nullable=True)
     currency = Column(String, nullable=True)
@@ -70,19 +63,77 @@ class Trade(Base):
     close_time = Column(DateTime, nullable=True)
     open_price = Column(Float)
     close_price = Column(Float, nullable=True)
-    status = Column(String, default="open")  # open, closed
-    result = Column(String, nullable=True)  # win, loss, draw
+    status = Column(String, default="open")
+    result = Column(String, nullable=True)
     user = relationship("User")
 
 Base.metadata.create_all(bind=engine)
 
 # ===========================
-# تطبيق Flask
+# Flask App
 # ===========================
 app = Flask(__name__)
 
 # ===========================
-# دوال مساعدة
+# استراتيجة متقدمة
+# ===========================
+def fetch_ohlcv(symbol, limit=50):
+    try:
+        coin = symbol.split("-")[0].lower()
+        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={limit}&interval=daily"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        df = pd.DataFrame(data['prices'], columns=['timestamp', 'close'])
+        df['high'] = [x[1] for x in data['prices']]
+        df['low'] = [x[1] for x in data['prices']]
+        df['volume'] = [v[1] for v in data['total_volumes']]
+        df['close'] = df['close']
+        return df
+    except Exception as e:
+        print(f"خطأ في جلب OHLCV لـ {symbol}: {e}")
+        return pd.DataFrame()
+
+def moving_average(series, period=20):
+    return series.rolling(period).mean()
+
+def support_resistance(df):
+    recent_high = df['high'][-50:].max()
+    recent_low = df['low'][-50:].min()
+    return recent_low, recent_high
+
+def fibonacci_levels(df):
+    high = df['high'][-50:].max()
+    low = df['low'][-50:].min()
+    return {
+        "50%": high - 0.5*(high-low),
+        "61.8%": high - 0.618*(high-low)
+    }
+
+def check_signal(symbol):
+    df = fetch_ohlcv(symbol)
+    if df.empty or len(df) < 20:
+        return False
+    close = df['close']
+    ma20 = moving_average(close, 20).iloc[-1]
+    ma50 = moving_average(close, 50).iloc[-1]
+    current_price = close.iloc[-1]
+    if ma20 < ma50:
+        return False
+    support, resistance = support_resistance(df)
+    fib_levels = fibonacci_levels(df)
+    entry_zone = min(support, fib_levels['50%'], fib_levels['61.8%'])
+    return entry_zone < current_price < resistance
+
+def trade_targets(entry_price):
+    return {
+        "take_profit_1": entry_price*1.04,
+        "take_profit_2": entry_price*1.10,
+        "stop_loss": entry_price*0.95
+    }
+
+# ===========================
+# وظائف مساعدة
 # ===========================
 def send_message(chat_id, text):
     try:
@@ -106,177 +157,185 @@ def get_user(session, telegram_id, create_if_not_exist=True, user_info=None):
 def get_active_subscriptions(session, user_id):
     now = datetime.utcnow()
     return session.query(Subscription).filter(
-        Subscription.user_id == user_id,
-        Subscription.status == "active",
-        Subscription.start_date <= now,
-        Subscription.end_date >= now
+        Subscription.user_id==user_id,
+        Subscription.status=="active",
+        Subscription.start_date<=now,
+        Subscription.end_date>=now
     ).all()
 
-def get_active_subscription_by_strategy(session, user_id, strategy):
+def get_active_subscription_by_strategy(session, user_id):
     now = datetime.utcnow()
     return session.query(Subscription).filter(
-        Subscription.user_id == user_id,
-        Subscription.strategy == strategy,
-        Subscription.status == "active",
-        Subscription.start_date <= now,
-        Subscription.end_date >= now
+        Subscription.user_id==user_id,
+        Subscription.strategy=="strategy_advanced",
+        Subscription.status=="active",
+        Subscription.start_date<=now,
+        Subscription.end_date>=now
     ).first()
 
 def expire_subscriptions():
     session = SessionLocal()
     now = datetime.utcnow()
-    expired = session.query(Subscription).filter(Subscription.status=="active", Subscription.end_date < now).all()
+    expired = session.query(Subscription).filter(
+        Subscription.status=="active",
+        Subscription.end_date<now
+    ).all()
     for sub in expired:
         sub.status = "expired"
         session.add(sub)
     session.commit()
     session.close()
 
-def create_nowpayments_invoice(telegram_id, amount_usd, pay_currency="usdt"):
-    url = "https://api.nowpayments.io/v1/invoice"
-    headers = {"x-api-key": NOWPAYMENTS_API_KEY,"Content-Type":"application/json"}
-    data = {
-        "price_amount": amount_usd,
-        "price_currency": "usd",
-        "pay_currency": pay_currency,
-        "order_description": json.dumps({"telegram_id": str(telegram_id)}),
-        "order_id": str(telegram_id),
-        "ipn_callback_url": f"https://market-signals-bot.onrender.com{NOWPAYMENTS_ROUTE}"
-    }
-    resp = requests.post(url, headers=headers, json=data)
-    if resp.status_code == 201:
-        return resp.json().get("invoice_url")
-    return None
-
 def get_current_price(symbol):
     try:
         coin = symbol.split("-")[0].lower()
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd"
         resp = requests.get(url, timeout=5)
-        data = resp.json()
-        return data.get(coin, {}).get("usd", 0)
-    except:
+        resp.raise_for_status()
+        return resp.json().get(coin, {}).get("usd", 0)
+    except Exception as e:
+        print(f"خطأ في السعر لـ {symbol}: {e}")
         return 0
-
-# ===========================
-# الاستراتيجية المحسنة
-# ===========================
-TARGETS = [1.04, 1.10]  # هدف 4٪ و10٪
-STOP_LOSS = 0.95        # وقف خسارة 5%
-
-def check_signal(symbol):
-    """
-    مثال بسيط: إشارة شراء إذا السعر الحالي أقل من المتوسط البسيط لـ 50 يوم
-    """
-    try:
-        # بيانات وهمية باستخدام CoinGecko
-        price = get_current_price(symbol)
-        sma50 = price * 1.02  # افتراض: المتوسط 50 يوم أعلى 2٪ من السعر الحالي
-        if price < sma50:
-            return True
-    except:
-        return False
-    return False
 
 def update_recommendations_status():
     session = SessionLocal()
-    open_trades = session.query(Trade).filter(Trade.status=="open").all()
-    for trade in open_trades:
-        price = get_current_price(trade.symbol)
-        if price <= trade.open_price * STOP_LOSS:
-            trade.status = "closed"
-            trade.close_price = price
-            trade.close_time = datetime.utcnow()
-            trade.result = "loss"
-            send_message(int(trade.user.telegram_id), f"⚠️ تم إغلاق صفقة {trade.symbol} بالخسارة عند {price}")
-        elif price >= trade.open_price * TARGETS[0] and trade.result is None:
-            trade.result = "partial_win"  # تحقق الهدف الأول
-            send_message(int(trade.user.telegram_id), f"✅ وصل الهدف الأول 4٪ لصفقة {trade.symbol}")
-        elif price >= trade.open_price * TARGETS[1]:
-            trade.status = "closed"
-            trade.close_price = price
-            trade.close_time = datetime.utcnow()
-            trade.result = "win"
-            send_message(int(trade.user.telegram_id), f"🏆 تم إغلاق صفقة {trade.symbol} بالربح 10٪ عند {price}")
-        session.add(trade)
-    session.commit()
-    session.close()
+    try:
+        open_trades = session.query(Trade).filter(Trade.status=="open").all()
+        for trade in open_trades:
+            current_price = get_current_price(trade.symbol)
+            targets = trade_targets(trade.open_price)
+            if current_price <= targets["stop_loss"]:
+                trade.status="closed"
+                trade.close_time=datetime.utcnow()
+                trade.close_price=current_price
+                trade.result="loss"
+                session.add(trade)
+                send_message(int(trade.user.telegram_id), f"⚠️ تم إغلاق صفقة {trade.symbol} بالخسارة عند {current_price}")
+            elif current_price >= targets["take_profit_2"]:
+                trade.status="closed"
+                trade.close_time=datetime.utcnow()
+                trade.close_price=current_price
+                trade.result="win"
+                session.add(trade)
+                send_message(int(trade.user.telegram_id), f"✅ تم إغلاق صفقة {trade.symbol} بالربح عند {current_price}")
+        session.commit()
+    finally:
+        session.close()
 
 # ===========================
-# Flask Webhook + NowPayments
+# Flask Webhook
 # ===========================
 @app.route(WEBHOOK_ROUTE, methods=["POST"])
 def telegram_webhook():
-    expire_subscriptions()
-    update_recommendations_status()
-    data = request.get_json()
-    if not data or "message" not in data:
+    update = request.get_json()
+    if not update or "message" not in update:
         return "ok"
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text","")
-    from_user = msg.get("from",{})
+    message = update["message"]
+    chat_id = message["chat"]["id"]
+    text = message.get("text","")
+    from_user = message.get("from", {})
     telegram_id = str(from_user.get("id"))
     session = SessionLocal()
-    user = get_user(session, telegram_id, True, from_user)
-    active_subs = get_active_subscriptions(session, user.id)
-
-    if text == "/start":
-        send_message(chat_id, f"مرحبًا {user.first_name or ''} 👋")
-    elif text.startswith("/subscribe"):
-        # إنشاء فاتورة
-        amount = 50  # مبلغ افتراضي لكل الاشتراكات
-        invoice_url = create_nowpayments_invoice(telegram_id, amount)
-        if invoice_url:
-            send_message(chat_id, f"ادفع للاشتراك: {invoice_url}")
+    try:
+        user = get_user(session, telegram_id, True, from_user)
+        active_sub = get_active_subscription_by_strategy(session, user.id)
+        if text=="/start":
+            send_message(chat_id,f"مرحبًا {user.first_name or ''} 👋\nالبوت يعمل بنجاح.\nاستخدم /help لمعرفة الأوامر.")
+        elif text=="/help":
+            send_message(chat_id,"/subscribe - الاشتراك\n/status - حالة الاشتراك\n/advice - التوصيات")
+        elif text=="/subscribe":
+            if active_sub:
+                send_message(chat_id,"🚫 لديك اشتراك فعال بالفعل.")
+            else:
+                invoice_url = create_nowpayments_invoice(telegram_id, 50)
+                if invoice_url:
+                    send_message(chat_id,f"يرجى الدفع عبر الرابط:\n{invoice_url}")
+                else:
+                    send_message(chat_id,"خطأ في إنشاء رابط الدفع.")
+        elif text=="/status":
+            if not active_sub:
+                send_message(chat_id,"🚫 لا يوجد اشتراك نشط.")
+            else:
+                send_message(chat_id,f"اشتراكك فعال حتى {active_sub.end_date.strftime('%Y-%m-%d')}")
+        elif text=="/advice":
+            if not active_sub:
+                send_message(chat_id,"🚫 يرجى الاشتراك أولاً.")
+            else:
+                symbols = ["BTC-USDT","ETH-USDT","XRP-USDT"]
+                messages=[]
+                for sym in symbols:
+                    if check_signal(sym):
+                        messages.append(f"📈 توصية شراء لـ {sym}")
+                send_message(chat_id,"\n".join(messages) if messages else "📊 لا توجد توصيات حالياً.")
         else:
-            send_message(chat_id, "حدث خطأ في إنشاء الفاتورة")
-    elif text == "/advice":
-        messages=[]
-        symbols = ["BTC-USDT","ETH-USDT","XRP-USDT"]
-        for sym in symbols:
-            if check_signal(sym):
-                messages.append(f"📈 توصية شراء لـ {sym}")
-        if messages:
-            send_message(chat_id,"\n\n".join(messages))
-        else:
-            send_message(chat_id,"📊 لا توجد توصيات حالياً.")
-    session.close()
-    return "ok"
-
-@app.route(NOWPAYMENTS_ROUTE, methods=["POST"])
-def nowpayments_webhook():
-    sig = request.headers.get("x-nowpayments-sig")
-    if sig != NOWPAYMENTS_IPN_SECRET:
-        return "Unauthorized",401
-    data = request.get_json()
-    if data.get("payment_status")=="finished":
-        telegram_id = json.loads(data.get("order_description")).get("telegram_id")
-        session = SessionLocal()
-        user = get_user(session, telegram_id, False)
-        if user:
-            start = datetime.utcnow()
-            end = start + timedelta(days=30)
-            sub = Subscription(user_id=user.id,strategy="strategy_one",start_date=start,end_date=end,status="active",
-                               payment_id=data.get("payment_id"),amount=data.get("pay_amount"),currency=data.get("pay_currency"))
-            session.add(sub)
-            session.commit()
-            send_message(int(user.telegram_id),f"✅ تم تفعيل اشتراكك حتى {end.strftime('%Y-%m-%d')}")
+            send_message(chat_id,"❓ أمر غير معروف، استخدم /help للمساعدة.")
+    finally:
         session.close()
     return "ok"
 
-@app.route("/")
-def home():
-    return "بوت market-signals-bot يعمل بنظام Webhook و NowPayments IPN."
+# ===========================
+# NowPayments IPN
+# ===========================
+def create_nowpayments_invoice(telegram_id, amount_usd):
+    url="https://api.nowpayments.io/v1/invoice"
+    headers={"x-api-key":NOWPAYMENTS_API_KEY,"Content-Type":"application/json"}
+    data={
+        "price_amount":amount_usd,
+        "price_currency":"usd",
+        "pay_currency":"usdt",
+        "order_description": json.dumps({"telegram_id": str(telegram_id)}),
+        "order_id": str(telegram_id),
+        "ipn_callback_url": f"https://market-signals-bot.onrender.com{NOWPAYMENTS_ROUTE}"
+    }
+    resp=requests.post(url, headers=headers, json=data)
+    if resp.status_code==201:
+        return resp.json().get("invoice_url")
+    return None
+
+@app.route(NOWPAYMENTS_ROUTE, methods=["POST"])
+def nowpayments_webhook():
+    signature = request.headers.get("x-nowpayments-sig")
+    if signature != NOWPAYMENTS_IPN_SECRET:
+        return "Unauthorized",401
+    data=request.get_json()
+    payment_status = data.get("payment_status")
+    payment_id = data.get("payment_id")
+    amount = data.get("pay_amount")
+    currency = data.get("pay_currency")
+    custom_data = data.get("order_description")
+    if payment_status=="finished":
+        session=SessionLocal()
+        try:
+            telegram_id = str(json.loads(custom_data)["telegram_id"])
+            user=get_user(session,telegram_id,False)
+            if user:
+                start_date=datetime.utcnow()
+                end_date=start_date+timedelta(days=30)
+                sub=Subscription(user_id=user.id,strategy="strategy_advanced",
+                                 start_date=start_date,end_date=end_date,
+                                 status="active",payment_id=payment_id,
+                                 amount=amount,currency=currency)
+                session.add(sub)
+                session.commit()
+                send_message(int(user.telegram_id),f"✅ تم تفعيل اشتراكك حتى {end_date.strftime('%Y-%m-%d')}")
+        finally:
+            session.close()
+    return "ok"
 
 # ===========================
 # جدولة المهام
 # ===========================
 scheduler = BackgroundScheduler()
-scheduler.add_job(update_recommendations_status, "interval", minutes=5)
+scheduler.add_job(update_recommendations_status,"interval",minutes=5)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
+# ===========================
+# تشغيل Flask
+# ===========================
+@app.route("/")
+def home():
+    return "بوت market-signals-bot يعمل."
+
 if __name__=="__main__":
-    print("تشغيل بوت market-signals-bot...")
     app.run(host="0.0.0.0", port=PORT)
